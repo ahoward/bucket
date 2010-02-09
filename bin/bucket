@@ -1,40 +1,34 @@
 #! /usr/bin/env ruby
 
-# filename: bucket
-#
-# bucket foobar create
-# bucket foobar store foo.png
-# bucket foobar list
-#
-
+require 'yaml'
 require 'rubygems'
 require 'aws/s3'
-require 'progressbar'
 require 'mime/types'
 require 'main'
-require 'yaml'
+
 
 Main {
 
   name 'bucket'
 
-  description %| 
-    bucket is a command-line interface for amazon's s3 service.
-  |
+  description <<-__ 
+    bucket is an every day command-line tool for amazon's s3 service
+  __
 
-  Modes = [] 
+  examples <<-__
+    . bucket Configure
+    . bucket List
 
-  def self.mode name, &block
-    Modes << name.to_s and define_method name, &block
-  end
+    . bucket create bucket_name
+    . bucket store bucket_name file.jpg
+    . bucket list bucket_name
+    . bucket get bucket_name file.jpg > f.jpg
+    . bucket delete bucket_name file.jpg
+  __
 
   argument('name'){
     synopsis "the bucket name"
-  }
-
-  argument('mode'){
-    optional
-    synopsis "one of #{ Modes.join '|' }"
+    required false
   }
 
   option('access_key_id', 'K'){
@@ -73,23 +67,104 @@ Main {
   option('dirty', 'D'){
   }
 
-  parameters.each{|parameter| fattr parameter.name}
+  parameters.each{|parameter| fattr(parameter.name)}
 
   def run
+    help!
+  end
+
+  mode :Configure do
+    run do
+      generate_config
+    end
+  end
+
+  mode :List do
+    run do
+      puts AWS::S3::Service.buckets.map{|bucket| bucket.name}
+    end
+  end
+
+  mode :create do
+    run do
+      AWS::S3::Bucket.create namespaced(name)
+      puts "http://s3.amazonaws.com/#{ namespaced(name) }" ### HACKIY HACK
+    end
+  end
+
+  mode :store do
+    run do
+      path = argv.shift or abort "no path"
+      basename = File.basename path
+      key = argv.shift || path
+      key = File.basename key #unless path_info?
+      key = clean key unless dirty?
+      content_type = self.content_type || (MIME::Types.type_for(basename).first.content_type rescue 'text/plain')
+      options = {
+        :access => access,
+        :content_type => content_type,
+      }
+      open(path, 'r+') do |fd|
+        AWS::S3::S3Object.store key, fd, namespaced(name), options
+      end
+      puts AWS::S3::S3Object.url_for(key, namespaced(name), :authenticated => false)
+    end
+  end
+
+  mode :list do
+    run do
+      AWS::S3::Bucket.find(namespaced(name)).objects.each do |object|
+        puts object.url(:authenticated => false)
+      end
+    end
+  end
+
+  mode :get do
+    run do
+      key = argv.shift
+      bucket = AWS::S3::Bucket.find(namespaced(name))
+      if key
+        object = bucket[key]
+        if object
+          path = argv.shift
+          if path
+            open(path, 'w'){|fd| fd.write(object.value)}
+          else
+            STDOUT.write(object.value)
+          end
+        end
+      end
+    end
+  end
+
+  mode :delete do
+    run do
+      unless argv.empty?
+        key = argv.shift
+        key = File.basename key unless path_info?
+        key = clean key unless dirty?
+        object = AWS::S3::Bucket.find(namespaced(name))[key]
+        if object
+          url = object.url :authenticated => false
+          object.delete
+          puts url
+          exit(0)
+        else
+          exit(42)
+        end
+      end
+      AWS::S3::Bucket.delete(namespaced(name), :force => force) 
+    end
+  end
+
+  def before_run
     setup
     establish_connection
-    send mode
   end
 
   def setup
     load_config_yml
-    self.class.fattrs.each{|attr| send attr, params[attr].value if params.has_key?(attr)}
-    if %r/^[A-Z]/.match(name) or mode.nil?
-      argv.unshift mode
-      mode name.downcase.capitalize
-      name nil
-    end
-    abort "bad mode #{ mode }" unless respond_to? mode
+    self.class.fattrs.each{|attr| send(attr, params[attr].value) if params.has_key?(attr)}
   end
 
   def load_config_yml
@@ -120,88 +195,25 @@ Main {
     )
   end
 
-  mode :create do
-    AWS::S3::Bucket.create namespaced(name)
-    puts "http://s3.amazonaws.com/#{ namespaced(name) }" ### HACKIY HACK
-  end
-
-  mode :store do
-    path = argv.shift or abort "no path"
-    basename = File.basename path
-    key = argv.shift || path
-    key = File.basename key #unless path_info?
-    key = clean key unless dirty?
-    content_type = self.content_type || (MIME::Types.type_for(basename).first.content_type rescue 'text/plain')
-    options = {
-      :access => access,
-      :content_type => content_type,
-    }
-    open path, 'r+' do |fd|
-      progress = ProgressBar.new key, fd.stat.size
-      t = Thread.new do
-        Thread.current.abort_on_exception = true
-        AWS::S3::S3Object.store key, fd, namespaced(name), options
-      end
-      ### progress.set fd.pos and sleep 0.142 until fd.eof? if STDIN.tty?
-      t.join
-    end
-    puts AWS::S3::S3Object.url_for(key, namespaced(name), :authenticated => false)
-  end
-
   def clean path
     path.strip.downcase.gsub(%r/[^\.\w\d_-]/o, '_').squeeze('_')
-  end
-
-  mode :list do
-    AWS::S3::Bucket.find(namespaced(name)).objects.each do |object|
-      puts object.url(:authenticated => false)
-    end
-  end
-
-  mode :List do
-    puts AWS::S3::Service.buckets.map{|bucket| bucket.name}
-  end
-
-  mode :delete do
-    return delete_object unless argv.empty?
-    options = {
-      :force => force
-    }
-    AWS::S3::Bucket.delete namespaced(name), options
-  end
-
-  mode :delete_object do
-    key = argv.shift
-    key = File.basename key unless path_info?
-    key = clean key unless dirty?
-    object = AWS::S3::Bucket.find(namespaced(name))[key]
-    if object
-      url = object.url :authenticated => false
-      object.delete
-      puts url
-    else
-      exit 42
-    end
-  end
-
-  mode :init do
-    generate_config
   end
 
   def generate_config
     path = config || default_config_path
     unless(not force and test(?e, path))
-      open path, 'w' do |fd|
+      open(path, 'w') do |fd|
         config = <<-yml
           access_key_id     : 'AMAZON_ACCESS_KEY_ID'
           secret_access_key : 'AMAZON_SECRET_ACCESS_KEY'
           namespace         : 'this_will_be_prepended_to_all_keys'
+          ca_file           : '/full/path/to/precisely-named/aws-cert-HLI34MTJRZW5FKYNVLRUMAUEKBIZ3KL5.pem'
         yml
         formatted = config.split(%r/\n/).map{|line| line.strip}.join("\n")
         fd.puts formatted 
       end
       if STDIN.tty?
-        editor = ENV['EDITOR'] || ENV['EDIT'] || 'vi'
+        editor = ENV['EDITOR'] || ENV['EDIT'] || 'open'
         system "#{ editor } #{ path }"
       end
       puts "generated #{ path }"
