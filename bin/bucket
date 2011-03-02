@@ -12,22 +12,29 @@ Main {
   name 'bucket'
 
   description <<-__ 
+
     bucket is an every day command-line tool for amazon's s3 service
+
   __
 
   examples <<-__
-    . bucket Configure
+    . bucket Setup
+    . bucket Create bucket
     . bucket List
 
-    . bucket create bucket_name
-    . bucket store bucket_name file.jpg
-    . bucket list bucket_name
-    . bucket get bucket_name file.jpg > f.jpg
-    . bucket delete bucket_name file.jpg
+    . bucket name store file.jpg
+    . bucket name list
+    . bucket name get file.jpg > f.jpg
+    . bucket name delete file.jpg
   __
 
   argument('name'){
     synopsis "the bucket name"
+    required false
+  }
+
+  argument('op'){
+    synopsis "the bucket operation"
     required false
   }
 
@@ -70,92 +77,110 @@ Main {
   parameters.each{|parameter| fattr(parameter.name)}
 
   def run
-    help!
+    help! unless name?
+
+    case op
+      when /store/
+        store(*argv)
+
+      when /put/
+        store(*argv)
+
+      when /get/
+        get(*argv)
+
+      when /delete/
+        delete(*argv)
+
+      when /list/
+        list(*argv)
+
+      else
+        abort("no op #{ op.inspect }")
+    end
   end
 
-  mode :Configure do
+  def store(*argv)
+    abort('no name') unless name
+    path = argv.shift || abort('no path')
+    key = argv.shift
+
+    if test(?f, path)
+      store_file(path, key)
+    else
+      store_directory(path)
+    end
+  end
+
+  def get(*argv)
+    abort('no name') unless name
+    bucket = AWS::S3::Bucket.find(namespaced(name))
+    key = argv.shift || abort('no key')
+    if key
+      object = bucket[key]
+      if object
+        path = argv.shift
+        if path
+          open(path, 'w'){|fd| fd.write(object.value)}
+        else
+          STDOUT.write(object.value)
+        end
+      end
+    end
+  end
+
+  def delete(*argv)
+    abort('no name') unless name
+    unless argv.empty?
+      key = argv.shift || abort('no key')
+      object = AWS::S3::Bucket.find(namespaced(name))[key]
+      if object
+        url = object.url(:authenticated => false)
+        object.delete
+        puts(url)
+        exit(0)
+      else
+        exit(42)
+      end
+    end
+    AWS::S3::Bucket.delete(namespaced(name), :force => force) 
+  end
+
+  def list(*argv)
+    abort('no name') unless name
+    AWS::S3::Bucket.find(namespaced(name)).objects.each do |object|
+      puts(object.url(:authenticated => false))
+    end
+  end
+
+
+  mode :Setup do
     run do
       generate_config
     end
   end
 
-  mode :List do
-    run do
-      puts AWS::S3::Service.buckets.map{|bucket| bucket.name}
-    end
-  end
-
-  mode :create do
+  mode :Create do
     run do
       AWS::S3::Bucket.create namespaced(name)
       puts "http://s3.amazonaws.com/#{ namespaced(name) }" ### HACKIY HACK
     end
   end
 
-  mode :store do
+  mode :List do
     run do
-      path = argv.shift or abort "no path"
-      basename = File.basename path
-      key = argv.shift || path
-      key = File.basename key #unless path_info?
-      key = clean key unless dirty?
-      content_type = self.content_type || (MIME::Types.type_for(basename).first.content_type rescue 'text/plain')
-      options = {
-        :access => access,
-        :content_type => content_type,
-      }
-      open(path, 'r+') do |fd|
-        AWS::S3::S3Object.store key, fd, namespaced(name), options
-      end
-      puts AWS::S3::S3Object.url_for(key, namespaced(name), :authenticated => false)
-    end
-  end
-
-  mode :list do
-    run do
-      AWS::S3::Bucket.find(namespaced(name)).objects.each do |object|
-        puts object.url(:authenticated => false)
-      end
-    end
-  end
-
-  mode :get do
-    run do
-      key = argv.shift
-      bucket = AWS::S3::Bucket.find(namespaced(name))
-      if key
-        object = bucket[key]
-        if object
-          path = argv.shift
-          if path
-            open(path, 'w'){|fd| fd.write(object.value)}
-          else
-            STDOUT.write(object.value)
-          end
+      if name.nil?
+        puts AWS::S3::Service.buckets.map{|bucket| bucket.name}
+      else
+        AWS::S3::Bucket.find(namespaced(name)).objects.each do |object|
+          puts object.url(:authenticated => false)
         end
       end
     end
   end
 
-  mode :delete do
-    run do
-      unless argv.empty?
-        key = argv.shift
-        key = File.basename key unless path_info?
-        key = clean key unless dirty?
-        object = AWS::S3::Bucket.find(namespaced(name))[key]
-        if object
-          url = object.url :authenticated => false
-          object.delete
-          puts url
-          exit(0)
-        else
-          exit(42)
-        end
-      end
-      AWS::S3::Bucket.delete(namespaced(name), :force => force) 
-    end
-  end
+
+
 
   def before_run
     setup
@@ -181,11 +206,11 @@ Main {
 
   def default_config_path
     home = File.expand_path '~'
-    path = File.join home, '.bucket.yml'
+    path = File.join(home, '.bucket.yml')
   end
 
   def namespaced arg, *argv
-    argv.unshift arg and [ namespace, argv ].compact.join('.')
+    argv.unshift arg and [namespace, argv].compact.join('.')
   end
 
   def establish_connection
@@ -195,8 +220,8 @@ Main {
     )
   end
 
-  def clean path
-    path.strip.downcase.gsub(%r/[^\.\w\d_-]/o, '_').squeeze('_')
+  def clean(path)
+    File.basename(path.to_s.strip).downcase.gsub(%r/[^\.\w\d_-]/o, '_').squeeze('_')
   end
 
   def generate_config
@@ -220,6 +245,38 @@ Main {
     else
       warn "exists #{ path }"
       exit 42
+    end
+  end
+
+  def store_file(path, key)
+    basename = File.basename(path)
+    unless key
+      key = basename
+      key = clean(key) unless dirty?
+    end
+    content_type = self.content_type || (MIME::Types.type_for(basename).first.content_type rescue 'text/plain')
+    options = {
+      :access => access,
+      :content_type => content_type,
+    }
+    open(path, 'r+') do |fd|
+      AWS::S3::S3Object.store(key, fd, namespaced(name), options)
+    end
+    url = AWS::S3::S3Object.url_for(key, namespaced(name), :authenticated => false)
+    puts(url)
+  end
+
+  def store_directory(path)
+    Dir.chdir(path) do
+      path = File.basename(path)
+      Dir.glob('**/**').each do |entry|
+        next unless test(?f, entry)
+        dirname, basename = File.split(entry)
+        key = basename
+        key = clean(key) unless dirty?
+        key = File.join(path, dirname, basename).squeeze('/').sub(%r|^[./]+|,'').sub(%r|/+$|,'').sub(%r|[.]+[/]+|,'').sub(%r|[?].*$|,'')
+        store_file(entry, key)
+      end
     end
   end
 }
